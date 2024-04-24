@@ -18,7 +18,7 @@ async function getGroqResponse(query) {
           content: query,
         },
       ],
-      model: "mixtral-8x7b-32768",
+      model: process.env.GROQ_MODEL,
     });
 
     return completion.choices[0].message.content;

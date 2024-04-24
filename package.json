@@ -1,12 +1,12 @@
 {
   "name": "groq-telegram",
   "type": "module",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Use Groq within Telegram",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon src/bot.js",
-    "start": "node src/bot.js"
+    "dev": "nodemon",
+    "start": "node"
   },
   "author": "konstantine-v",
   "license": "MIT",
