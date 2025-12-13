@@ -1,6 +1,6 @@
 ## Groq-Telegram
 
-A template for chatting with Groq models in Telegram.
+A template for chatting with Groq models in Telegram using TypeScript
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ TBD
 
 ## Prerequisites
 
-- I prefer [bun]() to npm, but the commands are the same for npm/yarn/pnpm etc. But make sure that's installed.
+This project is primarily designed to be used with [bun](https://bun.sh). The commands shown use bun, but you can adapt them for npm, yarn, or pnpm if preferred. Be sure to have bun installed before proceeding.
 
 
 ## Dev / Testing
@@ -27,5 +27,4 @@ Start typing to your bot.
 I/O should be printed in the console so you can see.
 
 ## Deploy
-
 `bun run start`
