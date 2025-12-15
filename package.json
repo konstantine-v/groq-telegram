@@ -6,6 +6,7 @@
   "main": "index.ts",
   "scripts": {
     "dev": "bun --watch index.ts",
+    "lint": "bun run type-check",
     "start": "bun index.ts",
     "type-check": "bun --bun tsc --noEmit"
   },
