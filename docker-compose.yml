@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  bot:
+    image: oven/bun:latest
+    container_name: groq-telegram-bot
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    command: bun index.ts
+    restart: unless-stopped
+
