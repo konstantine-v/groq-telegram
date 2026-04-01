@@ -3,26 +3,29 @@ import Groq from "groq-sdk";
 import telegramifyMarkdown from "telegramify-markdown";
 import type {
   ChatCompletion,
+  AssistantMessage,
   Message,
   ChatMessage,
   MessageRole,
   ContextLimitValue,
-  History,
   ProcessMessageResult,
   Config,
 } from "./types";
 
-const envThinkingTokens = (): string | undefined =>
-  process.env.THINKING_TOKENS ?? process.env.Thinking_Tokens;
+const parseContextLimit = (limit: string): ContextLimitValue => {
+  if (limit === "all") return null;
+  const parsed = parseInt(limit, 10);
+  return isNaN(parsed) ? null : parsed;
+};
 
 const getConfig = (): Config => ({
   systemPrompt: process.env.SYSTEM_PROMPT ?? "You are a helpful assistant.",
-  contextLimit: process.env.CONTEXT_LIMIT ?? "5",
+  contextLimit: parseContextLimit(process.env.CONTEXT_LIMIT ?? "5"),
   model: process.env.GROQ_MODEL ?? "llama-3.1-8b-instant",
-  debugMode: process.env.DEBUG_MODE ?? "false",
+  debugMode: (process.env.DEBUG_MODE ?? "false").trim().toLowerCase() === "true",
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
   groqApiKey: process.env.GROQ_API_KEY,
-  thinkingTokens: envThinkingTokens() ?? "disabled",
+  thinkingTokens: (process.env.THINKING_TOKENS ?? process.env.Thinking_Tokens ?? "false").trim().toLowerCase() === "true",
 });
 
 const config = getConfig();
@@ -41,12 +44,6 @@ const bot = new Bot(
 );
 
 const conversationHistory: Map<number, Message[]> = new Map();
-
-const parseContextLimit = (limit: string): ContextLimitValue => {
-  if (limit === "all") return null;
-  const parsed = parseInt(limit, 10);
-  return isNaN(parsed) ? null : parsed;
-};
 
 const limitHistory = (history: readonly Message[], limit: ContextLimitValue): readonly Message[] => {
   if (limit === null) return history;
@@ -75,44 +72,10 @@ const buildMessages = (
   createUserMessage(currentMessage),
 ];
 
-const getHistory = (history: History, chatId: number): readonly Message[] =>
-  history.get(chatId) ?? [];
-
 const createMessage = (role: MessageRole, content: string): Message => ({
   role,
   content,
 });
-
-const addToHistory = (
-  history: History,
-  chatId: number,
-  userMessage: string,
-  assistantMessage: string
-): History => {
-  const current = getHistory(history, chatId);
-  const updated = new Map(history);
-  updated.set(chatId, [
-    ...current,
-    createMessage("user", userMessage),
-    createMessage("assistant", assistantMessage),
-  ]);
-  return updated;
-};
-
-/** Groq reasoning models may return `reasoning` and/or `think`…`</think>` inside `content` (see Groq reasoning docs). */
-type AssistantMessage = ChatCompletion["choices"][number]["message"] & {
-  reasoning?: string | null;
-};
-
-/** `enabled` / `true` / … → show reasoning + raw `content`; otherwise strip `think` blocks and omit `reasoning`. */
-const shouldShowThinkingTokens = (raw: string): boolean => {
-  const v = raw.trim().toLowerCase().replace(/^["']|["']$/g, "");
-  return v === "enabled" || v === "true" || v === "yes" || v === "1" || v === "on";
-};
-
-/** Qwen / Groq raw format uses `think`…`</think>` in `content`. */
-const stripThinkingTags = (text: string): string =>
-  text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
 /** Per Telegram MarkdownV2 rules for text outside entities. */
 const escapeMarkdownV2 = (text: string): string =>
@@ -154,25 +117,38 @@ const collectThinkInnerBlocks = (content: string): string[] => {
   return blocks;
 };
 
+type MessageParts = {
+  reasoning: string;
+  thinkBlocks: string[];
+  mainContent: string;
+  rawContent: string;
+};
+
+/** Single source of truth for decomposing a Groq completion message. */
+const extractMessageParts = (completion: ChatCompletion): MessageParts | undefined => {
+  const msg = completion.choices[0]?.message as AssistantMessage | undefined;
+  if (!msg) return undefined;
+  const rawContent = msg.content ?? "";
+  const reasoning = typeof msg.reasoning === "string" ? msg.reasoning.trim() : "";
+  const thinkBlocks = collectThinkInnerBlocks(rawContent);
+  const mainContent = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  return { reasoning, thinkBlocks, mainContent, rawContent };
+};
+
 const extractAssistantText = (
   completion: ChatCompletion,
   stripThinking: boolean
 ): string | undefined => {
-  const msg = completion.choices[0]?.message as AssistantMessage | undefined;
-  if (!msg) return undefined;
-
-  const content = msg.content ?? "";
-  const reasoning = typeof msg.reasoning === "string" ? msg.reasoning : "";
+  const parts = extractMessageParts(completion);
+  if (!parts) return undefined;
 
   if (stripThinking) {
-    const out = stripThinkingTags(content);
-    return out.length > 0 ? out : undefined;
+    return parts.mainContent.length > 0 ? parts.mainContent : undefined;
   }
 
-  const parts: string[] = [];
-  if (reasoning.trim().length > 0) parts.push(reasoning.trim());
-  if (content.trim().length > 0) parts.push(content.trim());
-  const merged = parts.join("\n\n");
+  const merged = [parts.reasoning, parts.rawContent]
+    .filter((s) => s.trim().length > 0)
+    .join("\n\n");
   return merged.length > 0 ? merged : undefined;
 };
 
@@ -180,37 +156,26 @@ const formatTelegramBody = (
   completion: ChatCompletion,
   stripThinking: boolean
 ): string | undefined => {
+  const parts = extractMessageParts(completion);
+  if (!parts) return undefined;
+
   if (stripThinking) {
-    const raw = extractAssistantText(completion, true);
-    return raw ? telegramifyMarkdown(raw, "escape") : undefined;
+    return parts.mainContent.length > 0
+      ? telegramifyMarkdown(parts.mainContent, "escape")
+      : undefined;
   }
 
-  const msg = completion.choices[0]?.message as AssistantMessage | undefined;
-  if (!msg) return undefined;
-
-  const content = msg.content ?? "";
-  const reasoning = typeof msg.reasoning === "string" ? msg.reasoning : "";
-
-  const parts: string[] = [];
-  const thinkBlocks = collectThinkInnerBlocks(content);
-  const contentWithoutThink = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-
-  const thinkingParts: string[] = [];
-  if (reasoning.trim().length > 0) thinkingParts.push(reasoning.trim());
-  if (thinkBlocks.length > 0) thinkingParts.push(thinkBlocks.join("\n\n"));
-
+  const result: string[] = [];
+  const thinkingParts = [parts.reasoning, ...parts.thinkBlocks].filter(
+    (s) => s.trim().length > 0
+  );
   if (thinkingParts.length > 0) {
-    parts.push(
-      formatMarkdownV2Blockquote(thinkingParts.join("\n\n"))
-    );
+    result.push(formatMarkdownV2Blockquote(thinkingParts.join("\n\n")));
   }
-
-  if (contentWithoutThink.length > 0) {
-    parts.push(telegramifyMarkdown(contentWithoutThink, "escape"));
+  if (parts.mainContent.length > 0) {
+    result.push(telegramifyMarkdown(parts.mainContent, "escape"));
   }
-
-  const merged = parts.filter(Boolean).join("\n\n");
-  return merged.length > 0 ? merged : undefined;
+  return result.length > 0 ? result.join("\n\n") : undefined;
 };
 
 const replyTelegramMarkdownV2 = async (
@@ -237,7 +202,7 @@ const createCompletion = async (
       model,
       stream: false,
     });
-    const stripThinking = !shouldShowThinkingTokens(config.thinkingTokens);
+    const stripThinking = !config.thinkingTokens;
     const historyText = extractAssistantText(completion, stripThinking);
     if (!historyText) return undefined;
     const telegramBody = formatTelegramBody(completion, stripThinking);
@@ -250,29 +215,27 @@ const createCompletion = async (
 };
 
 const processMessage = async (
-  history: History,
+  history: Map<number, Message[]>,
   chatId: number,
   query: string,
   config: Config
 ): Promise<ProcessMessageResult> => {
-  const contextLimit = parseContextLimit(config.contextLimit);
-  const chatHistory = getHistory(history, chatId);
-  const messages = buildMessages(chatHistory, query, contextLimit, config.systemPrompt);
+  const chatHistory = history.get(chatId) ?? [];
+  const messages = buildMessages(chatHistory, query, config.contextLimit, config.systemPrompt);
   const reply = await createCompletion(messages, config.model);
 
-  const updatedHistory = reply
-    ? addToHistory(history, chatId, query, reply.historyText)
-    : history;
+  if (reply) {
+    history.set(chatId, [
+      ...chatHistory,
+      createMessage("user", query),
+      createMessage("assistant", reply.historyText),
+    ]);
+  }
 
   return {
     response: reply?.historyText,
     telegramBody: reply?.telegramBody,
-    updatedHistory,
   };
-};
-
-const updateHistory = (target: Map<number, Message[]>, source: History): void => {
-  source.forEach((value, key) => target.set(key, [...value]));
 };
 
 const logDebug = (username: string | undefined, message: string, response: string | undefined): void => {
@@ -292,16 +255,14 @@ const handleTextMessage = async (ctx: Context): Promise<void> => {
 
   if (!text || !chatId) return;
 
-  const { response, telegramBody, updatedHistory } = await processMessage(
+  const { response, telegramBody } = await processMessage(
     conversationHistory,
     chatId,
     text,
     config
   );
 
-  updateHistory(conversationHistory, updatedHistory);
-
-  if (config.debugMode === "true") {
+  if (config.debugMode) {
     logDebug(ctx.from?.username, text, response);
   }
 
