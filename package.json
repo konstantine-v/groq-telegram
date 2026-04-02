@@ -1,7 +1,7 @@
 {
   "name": "groq-telegram-ts-bun",
   "type": "module",
-  "version": "2.2.1",
+  "version": "2.3",
   "description": "Chat with an LLM model via Groq within Telegram. Utilizing TypeScript and Bun.",
   "main": "index.ts",
   "scripts": {
