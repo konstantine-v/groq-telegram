@@ -103,15 +103,19 @@ const weatherFailure = (
 
 const fetchCurrentWeather = async (
   city: string,
-  apiKey: string | undefined
+  apiKey: string | undefined,
+  debugMode: boolean
 ): Promise<WeatherFetchResult> => {
   const trimmed = city.trim();
   if (!apiKey || apiKey.length === 0) {
+    if (debugMode) console.log("[debug] OpenWeather: no OPENWEATHER_API_KEY loaded — fetch skipped (reply will be the missing-key message)");
     return weatherFailure("missing_api_key", "Set OPENWEATHER_API_KEY in the environment.");
   }
-  if (trimmed.length === 0) {
+  if (trimmed.length === 0)
     return weatherFailure("invalid_response", "City name is empty.");
-  }
+
+  if (debugMode)
+    console.log(`[debug] OpenWeather: GET /data/2.5/weather q=${JSON.stringify(trimmed)} appid_length=${String(apiKey.length)}`);
 
   const url = new URL("https://api.openweathermap.org/data/2.5/weather");
   url.searchParams.set("q", trimmed);
@@ -124,6 +128,8 @@ const fetchCurrentWeather = async (
     const parsed = parseOpenWeatherJson(json);
 
     if (!parsed) {
+      if (debugMode)
+        console.log("[debug] OpenWeather: response body was not JSON object — not from API as expected");
       return weatherFailure("invalid_response", "Could not parse weather response.");
     }
 
@@ -131,6 +137,8 @@ const fetchCurrentWeather = async (
       const rec = isRecord(json) ? json : {};
       const cod = readCod(rec);
       if (cod === "404" || cod === 404) {
+        if (debugMode)
+          console.log(`[debug] OpenWeather: HTTP ${String(res.status)} cod=404 — city not found`);
         return weatherFailure("city_not_found", `No results for "${trimmed}".`);
       }
       const msg =
@@ -139,12 +147,16 @@ const fetchCurrentWeather = async (
           : typeof parsed.message === "string"
             ? parsed.message
             : res.statusText;
+      if (debugMode)
+        console.log(`[debug] OpenWeather: HTTP ${String(res.status)} error=${JSON.stringify(msg)}`);
       return weatherFailure("upstream_error", msg || `HTTP ${String(res.status)}`);
     }
 
     const bodyRec = isRecord(json) ? json : {};
     const cod = readCod(bodyRec);
     if (cod !== 200 && cod !== "200") {
+      if (debugMode)
+        console.log(`[debug] OpenWeather: unexpected cod in body ${String(cod)}`);
       return weatherFailure("invalid_response", "Unexpected response from weather API.");
     }
 
@@ -152,9 +164,14 @@ const fetchCurrentWeather = async (
     if (!data) {
       return weatherFailure("invalid_response", "Incomplete weather data.");
     }
+    if (debugMode)
+      console.log(`[debug] OpenWeather: pulled from API http=${String(res.status)} name=${JSON.stringify(data.cityName)} country=${JSON.stringify(data.countryCode)} tempC=${String(data.tempC)} condition=${JSON.stringify(data.condition)}`);
     return { ok: true, data };
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : "Request failed.";
+    if (debugMode) {
+      console.log(`[debug] OpenWeather: fetch threw ${JSON.stringify(msg)}`);
+    }
     return weatherFailure("upstream_error", msg);
   }
 };
@@ -416,13 +433,11 @@ const handleTextMessage = async (ctx: Context): Promise<void> => {
     config
   );
 
-  if (config.debugMode) {
+  if (config.debugMode)
     logDebug(ctx.from?.username, text, response);
-  }
 
-  if (telegramBody && response) {
+  if (telegramBody && response)
     await replyTelegramMarkdownV2(ctx, telegramBody, response);
-  }
 };
 
 bot.command("weather", async (ctx) => {
@@ -433,7 +448,7 @@ bot.command("weather", async (ctx) => {
     await ctx.reply("Usage: /weather <city>\nExample: /weather Tbilisi");
     return;
   }
-  const result = await fetchCurrentWeather(cityArg, config.openWeatherApiKey);
+  const result = await fetchCurrentWeather(cityArg, config.openWeatherApiKey, config.debugMode);
   if (!result.ok) {
     await ctx.reply(result.error.message);
     return;
