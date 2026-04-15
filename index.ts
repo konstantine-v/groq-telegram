@@ -10,6 +10,9 @@ import type {
   ContextLimitValue,
   ProcessMessageResult,
   Config,
+  OpenWeatherCurrentResponse,
+  WeatherFetchResult,
+  WeatherSnapshot,
 } from "./types";
 
 const parseContextLimit = (limit: string): ContextLimitValue => {
@@ -25,6 +28,7 @@ const getConfig = (): Config => ({
   debugMode: (process.env.DEBUG_MODE ?? "false").trim().toLowerCase() === "true",
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
   groqApiKey: process.env.GROQ_API_KEY,
+  openWeatherApiKey: process.env.OPENWEATHER_API_KEY?.trim() || undefined,
   thinkingTokens: (process.env.THINKING_TOKENS ?? process.env.Thinking_Tokens ?? "false").trim().toLowerCase() === "true",
 });
 
@@ -34,6 +38,126 @@ if (!config.telegramBotToken) {
   console.error("TELEGRAM_BOT_TOKEN is required.");
   process.exit(1);
 }
+
+const OPENWEATHER_TIMEOUT_MS = 15_000;
+
+const celsiusToFahrenheit = (c: number): number => (c * 9) / 5 + 32;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const readCod = (raw: Record<string, unknown>): number | string | undefined => {
+  const cod = raw["cod"];
+  if (typeof cod === "number" || typeof cod === "string") return cod;
+  return undefined;
+};
+
+const normalizeOpenWeatherResponse = (raw: OpenWeatherCurrentResponse): WeatherSnapshot | undefined => {
+  const name = raw.name;
+  const main = raw.main;
+  if (typeof name !== "string" || name.length === 0 || !main) return undefined;
+  if (typeof main.temp !== "number" || typeof main.feels_like !== "number") return undefined;
+
+  const country =
+    raw.sys && typeof raw.sys.country === "string" ? raw.sys.country : "—";
+  const humidity = typeof main.humidity === "number" ? main.humidity : 0;
+  const windSpeed = raw.wind?.speed;
+  const windMps = typeof windSpeed === "number" ? windSpeed : undefined;
+
+  const first = raw.weather?.[0];
+  const condition =
+    typeof first?.description === "string" && first.description.length > 0
+      ? first.description
+      : typeof first?.main === "string" && first.main.length > 0
+        ? first.main
+        : "Unknown";
+
+  const tempC = main.temp;
+  const feelsC = main.feels_like;
+
+  return {
+    cityName: name,
+    countryCode: country,
+    tempC,
+    tempF: celsiusToFahrenheit(tempC),
+    feelsLikeC: feelsC,
+    feelsLikeF: celsiusToFahrenheit(feelsC),
+    condition,
+    humidity,
+    windMps,
+  };
+};
+
+const parseOpenWeatherJson = (raw: unknown): OpenWeatherCurrentResponse | undefined => {
+  if (!isRecord(raw)) return undefined;
+  return raw as OpenWeatherCurrentResponse;
+};
+
+const weatherFailure = (
+  kind: "missing_api_key" | "city_not_found" | "upstream_error" | "invalid_response",
+  message: string
+): Extract<WeatherFetchResult, { ok: false }> => ({
+  ok: false,
+  error: { kind, message },
+});
+
+const fetchCurrentWeather = async (
+  city: string,
+  apiKey: string | undefined
+): Promise<WeatherFetchResult> => {
+  const trimmed = city.trim();
+  if (!apiKey || apiKey.length === 0) {
+    return weatherFailure("missing_api_key", "Set OPENWEATHER_API_KEY in the environment.");
+  }
+  if (trimmed.length === 0) {
+    return weatherFailure("invalid_response", "City name is empty.");
+  }
+
+  const url = new URL("https://api.openweathermap.org/data/2.5/weather");
+  url.searchParams.set("q", trimmed);
+  url.searchParams.set("appid", apiKey);
+  url.searchParams.set("units", "metric");
+
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(OPENWEATHER_TIMEOUT_MS) });
+    const json: unknown = await res.json();
+    const parsed = parseOpenWeatherJson(json);
+
+    if (!parsed) {
+      return weatherFailure("invalid_response", "Could not parse weather response.");
+    }
+
+    if (!res.ok) {
+      const rec = isRecord(json) ? json : {};
+      const cod = readCod(rec);
+      if (cod === "404" || cod === 404) {
+        return weatherFailure("city_not_found", `No results for "${trimmed}".`);
+      }
+      const msg =
+        typeof rec["message"] === "string" && rec["message"].length > 0
+          ? rec["message"]
+          : typeof parsed.message === "string"
+            ? parsed.message
+            : res.statusText;
+      return weatherFailure("upstream_error", msg || `HTTP ${String(res.status)}`);
+    }
+
+    const bodyRec = isRecord(json) ? json : {};
+    const cod = readCod(bodyRec);
+    if (cod !== 200 && cod !== "200") {
+      return weatherFailure("invalid_response", "Unexpected response from weather API.");
+    }
+
+    const data = normalizeOpenWeatherResponse(parsed);
+    if (!data) {
+      return weatherFailure("invalid_response", "Incomplete weather data.");
+    }
+    return { ok: true, data };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "Request failed.";
+    return weatherFailure("upstream_error", msg);
+  }
+};
 
 const groq = new Groq({
   apiKey: config.groqApiKey,
@@ -190,6 +314,35 @@ const replyTelegramMarkdownV2 = async (
   }
 };
 
+const formatWeatherMarkdownV2 = (w: WeatherSnapshot): string => {
+  const head = `*${escapeMarkdownV2(w.cityName)}* \\(${escapeMarkdownV2(w.countryCode)}\\)`;
+  const cond = escapeMarkdownV2(w.condition);
+  const temp = `Temp: ${escapeMarkdownV2(`${w.tempC.toFixed(1)} °C`)} / ${escapeMarkdownV2(`${w.tempF.toFixed(1)} °F`)}`;
+  const feels = `Feels like: ${escapeMarkdownV2(`${w.feelsLikeC.toFixed(1)} °C`)} / ${escapeMarkdownV2(`${w.feelsLikeF.toFixed(1)} °F`)}`;
+  const hum = `Humidity: ${escapeMarkdownV2(`${String(w.humidity)}%`)}`;
+  const parts = [head, cond, temp, feels, hum];
+  if (w.windMps !== undefined) {
+    parts.push(`Wind: ${escapeMarkdownV2(`${w.windMps.toFixed(1)} m/s`)}`);
+  }
+  return parts.join("\n\n");
+};
+
+const formatWeatherPlain = (w: WeatherSnapshot): string => {
+  const lines = [
+    `${w.cityName} (${w.countryCode})`,
+    "",
+    w.condition,
+    "",
+    `Temp: ${w.tempC.toFixed(1)} °C / ${w.tempF.toFixed(1)} °F`,
+    `Feels like: ${w.feelsLikeC.toFixed(1)} °C / ${w.feelsLikeF.toFixed(1)} °F`,
+    `Humidity: ${w.humidity}%`,
+  ];
+  if (w.windMps !== undefined) {
+    lines.push(`Wind: ${w.windMps.toFixed(1)} m/s`);
+  }
+  return lines.join("\n");
+};
+
 type GroqReply = { readonly historyText: string; readonly telegramBody: string };
 
 const createCompletion = async (
@@ -254,6 +407,7 @@ const handleTextMessage = async (ctx: Context): Promise<void> => {
   const chatId = ctx.chat?.id;
 
   if (!text || !chatId) return;
+  if (text.startsWith("/")) return;
 
   const { response, telegramBody } = await processMessage(
     conversationHistory,
@@ -271,10 +425,38 @@ const handleTextMessage = async (ctx: Context): Promise<void> => {
   }
 };
 
+bot.command("weather", async (ctx) => {
+  const text = ctx.message?.text?.trim() ?? "";
+  const m = /^\/weather(?:@\w+)?\s*(.*)$/is.exec(text);
+  const cityArg = (m?.[1] ?? "").trim();
+  if (!cityArg) {
+    await ctx.reply("Usage: /weather <city>\nExample: /weather Tbilisi");
+    return;
+  }
+  const result = await fetchCurrentWeather(cityArg, config.openWeatherApiKey);
+  if (!result.ok) {
+    await ctx.reply(result.error.message);
+    return;
+  }
+  await replyTelegramMarkdownV2(
+    ctx,
+    formatWeatherMarkdownV2(result.data),
+    formatWeatherPlain(result.data)
+  );
+});
+
 bot.on("message:text", handleTextMessage);
 
 bot.catch((err) => {
   console.error("Bot error:", err);
 });
+
+try {
+  await bot.api.setMyCommands([
+    { command: "weather", description: "Current weather for a city" },
+  ]);
+} catch (e: unknown) {
+  console.error("setMyCommands failed:", e);
+}
 
 bot.start();
